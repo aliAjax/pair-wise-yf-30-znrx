@@ -54,6 +54,13 @@ def report_deadline(received_at: datetime, serious: bool, fatal: bool) -> dateti
     return received_at + timedelta(days=90)
 
 
+def followup_due(received_at: datetime, serious: bool, fatal: bool) -> datetime:
+    """随访任务到期时间：严重或死亡按入库时间 30 天后，非严重 90 天后。"""
+    if serious or fatal:
+        return received_at + timedelta(days=30)
+    return received_at + timedelta(days=90)
+
+
 class Repository:
     def __init__(self, db_path: str | Path):
         self.db_path = str(db_path)
@@ -140,6 +147,18 @@ class Repository:
                 created_at TEXT NOT NULL,
                 UNIQUE(case_id, case_revision)
             );
+            CREATE TABLE IF NOT EXISTS followup_tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL REFERENCES cases(id),
+                due_at TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                note TEXT,
+                closed_at TEXT,
+                closed_by TEXT,
+                followup_id INTEGER REFERENCES followups(id),
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_followup_tasks_case ON followup_tasks(case_id, status);
             CREATE TABLE IF NOT EXISTS audit_log (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 case_id INTEGER,
@@ -188,6 +207,41 @@ class PharmacovigilanceService:
         if not row:
             raise ApiError(404, "case_not_found", "案例不存在")
         return row
+
+    @staticmethod
+    def _open_followup_task(conn: sqlite3.Connection, case_id: int) -> sqlite3.Row | None:
+        return conn.execute(
+            "SELECT * FROM followup_tasks WHERE case_id=? AND status='open' ORDER BY id", (case_id,)
+        ).fetchone()
+
+    def _plan_followup_task(self, conn: sqlite3.Connection, case_id: int, due: datetime, actor: str, role: str, note: str) -> sqlite3.Row:
+        cursor = conn.execute(
+            "INSERT INTO followup_tasks(case_id,due_at,status,note,created_at) VALUES(?,?,?,?,?)",
+            (case_id, iso(due), "open", note, iso()),
+        )
+        task = conn.execute("SELECT * FROM followup_tasks WHERE id=?", (cursor.lastrowid,)).fetchone()
+        Repository.audit(conn, case_id, actor, role, "followup_task_planned", {"task_id": task["id"], "due_at": task["due_at"], "note": note})
+        return task
+
+    def _close_followup_task(self, conn: sqlite3.Connection, task: sqlite3.Row, status: str, actor: str, role: str, followup_id: int | None = None) -> None:
+        conn.execute(
+            "UPDATE followup_tasks SET status=?,closed_at=?,closed_by=?,followup_id=? WHERE id=?",
+            (status, iso(), actor, followup_id, task["id"]),
+        )
+        Repository.audit(conn, task["case_id"], actor, role, "followup_task_closed", {"task_id": task["id"], "status": status, "followup_id": followup_id})
+
+    def _consolidate_followup_tasks(self, conn: sqlite3.Connection, source_id: int, target_id: int, actor: str, role: str) -> sqlite3.Row | None:
+        """合并后目标案例只留一个未关闭任务：目标已有更早待随访则沿用，否则采用来源排期。"""
+        source_open = self._open_followup_task(conn, source_id)
+        if not source_open:
+            return self._open_followup_task(conn, target_id)
+        self._close_followup_task(conn, source_open, "merged", actor, role)
+        target_open = self._open_followup_task(conn, target_id)
+        if target_open and target_open["due_at"] <= source_open["due_at"]:
+            return target_open
+        if target_open:
+            self._close_followup_task(conn, target_open, "superseded", actor, role)
+        return self._plan_followup_task(conn, target_id, parse_time(source_open["due_at"]), actor, role, f"合并自案例 {source_id} 的随访计划")
 
     def create_case(self, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         required = ("patient_ref", "region", "product", "event_term", "source", "dedupe_key")
@@ -240,6 +294,7 @@ class PharmacovigilanceService:
             "case": dict(case),
             "intakes": [dict(r) for r in conn.execute("SELECT id,source,dedupe_key,received_at,created_by,created_at FROM intakes WHERE case_id=? ORDER BY id", (case_id,))],
             "followups": [dict(r) for r in conn.execute("SELECT * FROM followups WHERE case_id=? ORDER BY revision", (case_id,))],
+            "followup_tasks": [dict(r) for r in conn.execute("SELECT * FROM followup_tasks WHERE case_id=? ORDER BY id", (case_id,))],
             "reports": [dict(r) for r in conn.execute("SELECT * FROM reports WHERE case_id=? ORDER BY country", (case_id,))],
             "reviews": [dict(r) for r in conn.execute("SELECT * FROM medical_reviews WHERE case_id=? ORDER BY id", (case_id,))],
             "audit": [dict(r) for r in conn.execute("SELECT actor,role,action,detail_json,created_at FROM audit_log WHERE case_id=? ORDER BY id", (case_id,))] if role in {"medical_reviewer", "global_admin"} else [],
@@ -276,7 +331,7 @@ class PharmacovigilanceService:
             revision = case["revision"] + 1
             received = parse_time(body.get("received_at"), utcnow())
             due = report_deadline(received, bool(case["serious"]), bool(case["fatal"]))
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO followups(case_id,content,source,received_at,revision,created_by,created_at) VALUES(?,?,?,?,?,?,?)",
                 (case_id, content, source, iso(received), revision, actor, iso()),
             )
@@ -285,7 +340,11 @@ class PharmacovigilanceService:
                 (revision, iso(received), iso(due), iso(), case_id),
             )
             Repository.audit(conn, case_id, actor, role, "followup_added", {"revision": revision, "source": source})
-            return {"case": dict(self._case(conn, case_id)), "revision": revision}
+            open_task = self._open_followup_task(conn, case_id)
+            if open_task:
+                self._close_followup_task(conn, open_task, "done", actor, role, cursor.lastrowid)
+            task = self._plan_followup_task(conn, case_id, followup_due(received, bool(case["serious"]), bool(case["fatal"])), actor, role, "随访提交后续排")
+            return {"case": dict(self._case(conn, case_id)), "revision": revision, "followup_task": dict(task)}
 
     def medical_review(self, case_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "medical_reviewer":
@@ -320,7 +379,11 @@ class PharmacovigilanceService:
                 (case_id, expected, int(serious), int(fatal), causality, rationale, actor, iso()),
             )
             Repository.audit(conn, case_id, actor, role, "medical_reviewed", {"from_revision": expected, "serious": serious, "fatal": fatal, "causality": causality})
-            return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected}
+            open_task = self._open_followup_task(conn, case_id)
+            if open_task:
+                self._close_followup_task(conn, open_task, "superseded", actor, role)
+            task = self._plan_followup_task(conn, case_id, followup_due(parse_time(case["received_at"]), serious, fatal), actor, role, "医学裁定随访计划")
+            return {"case": dict(self._case(conn, case_id)), "reviewed_revision": expected, "followup_task": dict(task)}
 
     def create_report(self, case_id: int, actor: str, role: str, region: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"regional_lead", "global_admin"}:
@@ -372,9 +435,10 @@ class PharmacovigilanceService:
                 raise ApiError(409, "merge_conflict", "目标案例不可用，或产品与来源案例不一致")
             conn.execute("UPDATE cases SET status='merged',merged_into=?,revision=revision+1,updated_at=? WHERE id=?", (target_id, iso(), source_id))
             conn.execute("UPDATE intakes SET case_id=? WHERE case_id=?", (target_id, source_id))
+            target_task = self._consolidate_followup_tasks(conn, source_id, target_id, actor, role)
             Repository.audit(conn, target_id, actor, role, "case_merged_in", {"source_case_id": source_id})
             Repository.audit(conn, source_id, actor, role, "case_merged_into", {"target_case_id": target_id})
-            return {"case": dict(self._case(conn, source_id)), "idempotent": False}
+            return {"case": dict(self._case(conn, source_id)), "idempotent": False, "followup_task": dict(target_task) if target_task else None}
 
     def overdue(self, role: str, region: str) -> list[dict[str, Any]]:
         sql = "SELECT * FROM reports WHERE status!='submitted' AND due_at < ?"
@@ -394,9 +458,35 @@ class PharmacovigilanceService:
                 Repository.audit(conn, row["case_id"], actor, role, "report_overdue_escalated", {"report_id": row["id"], "country": row["country"]})
         return {"escalated": len(rows)}
 
+    FOLLOWUP_TASK_STATUSES = {"open", "done", "superseded", "merged"}
+
+    def list_followup_tasks(self, role: str, region: str, query: dict[str, list[str]]) -> list[dict[str, Any]]:
+        sql = """SELECT t.*,c.case_no,c.region,c.status AS case_status
+                 FROM followup_tasks t JOIN cases c ON c.id=t.case_id WHERE 1=1"""
+        args: list[Any] = []
+        if role not in {"medical_reviewer", "global_admin"}:
+            sql += " AND c.region=?"
+            args.append(region)
+        if query.get("status"):
+            status = query["status"][0]
+            if status not in self.FOLLOWUP_TASK_STATUSES:
+                raise ApiError(400, "invalid_status", f"status 必须是: {', '.join(sorted(self.FOLLOWUP_TASK_STATUSES))}")
+            sql += " AND t.status=?"
+            args.append(status)
+        if query.get("case_id"):
+            try:
+                case_id = int(query["case_id"][0])
+            except ValueError as exc:
+                raise ApiError(400, "invalid_case_id", "case_id 必须是整数") from exc
+            sql += " AND t.case_id=?"
+            args.append(case_id)
+        sql += " ORDER BY t.due_at,t.id"
+        return [dict(r) for r in self.repo.conn.execute(sql, args)]
+
     def state(self, role: str, region: str) -> dict[str, Any]:
         cases = self.list_cases(role, region, {})
-        return {"cases": cases, "overdue": self.overdue(role, region), "server_time": iso()}
+        return {"cases": cases, "overdue": self.overdue(role, region),
+                "followup_tasks": self.list_followup_tasks(role, region, {"status": ["open"]}), "server_time": iso()}
 
 
 def json_response(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -437,6 +527,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, {"cases": self.service.list_cases(role, region, query)}
         if path == "/api/overdue":
             return 200, {"reports": self.service.overdue(role, region)}
+        if path == "/api/followup-tasks":
+            return 200, {"tasks": self.service.list_followup_tasks(role, region, query)}
         parts = [part for part in path.split("/") if part]
         if len(parts) == 3 and parts[:2] == ["api", "cases"] and parts[2].isdigit():
             return 200, self.service.get_case(int(parts[2]), role, region)

@@ -22,7 +22,12 @@ python3 app.py --db pharmacovigilance.db
 - `POST /api/cases/{id}/medical-review`：医学审核员更新严重性、死亡和关联性。
 - `POST /api/cases/{id}/reports`、`POST /api/reports/{id}/submit`：生成并提交分国家报告。
 - `POST /api/cases/{id}/merge`：全局管理员合并重复案例。
+- `GET /api/followup-tasks`：查询随访计划任务，可按 `status`、`case_id` 过滤。
 - `POST /api/escalate-overdue`、`GET /api/overdue`：逾期检查与升级。
+
+## 随访计划
+
+医学裁定后自动为案例排随访任务：严重或死亡案例按入库时间 30 天后到期，非严重 90 天后到期。同一案例只保留一个未关闭任务；提交随访会关闭当前任务并按当前严重性续排下一次，再次裁定会取代旧任务。案例合并后，源案例的原任务保留仅供查询、不能再提交随访；若目标案例已有更早的待随访任务则沿用，否则采用来源案例的排期。报告逾期升级逻辑不受影响。
 
 ## 测试
 
